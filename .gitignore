@@ -1,0 +1,15 @@
+# Build output (build.sh, package.sh)
+/build/
+/dist/
+
+# Compiled Pawn scripts
+*.amx
+
+# Editors / tooling
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+*.swp
+*~
+.DS_Store
