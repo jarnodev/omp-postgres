@@ -13,8 +13,15 @@ struct PendingQuery
 {
 	int connectionId = 0;
 	IPawnScript* owner = nullptr;
-	std::string sql;
-	std::vector<QueryParam> params;
+	Statement statement;
+};
+
+// A transaction being built from Pawn (pg_tx_begin + pg_tx_add), not yet committed.
+struct PendingTransaction
+{
+	int connectionId = 0;
+	IPawnScript* owner = nullptr;
+	std::vector<Statement> statements;
 };
 
 class PostgresComponent final : public IComponent, public CoreEventHandler, public PawnEventHandler
@@ -51,8 +58,9 @@ public:
 	IPawnScript* scriptFor(AMX* amx) { return pawn_ ? pawn_->getScript(amx) : nullptr; }
 	uint64_t generationOf(IPawnScript* script) const;
 
-	// Connections. Ids start at 1 so 0 can mean "invalid" in Pawn.
-	int connect(const std::string& conninfo, std::string& error);
+	// Connections. Ids start at 1 so 0 can mean "invalid" in Pawn. A connection
+	// belongs to the script that opened it and is closed when that script unloads.
+	int connect(IPawnScript* owner, const std::string& conninfo, std::string& error);
 	bool disconnect(int id);
 	Connection* connection(int id);
 
@@ -60,10 +68,17 @@ public:
 	int newPendingQuery(int connectionId, IPawnScript* owner, std::string sql);
 	PendingQuery* pendingQuery(int id);
 	void dropPendingQuery(int id);
+	int newPendingTransaction(int connectionId, IPawnScript* owner);
+	PendingTransaction* pendingTransaction(int id);
+	void dropPendingTransaction(int id);
 	void send(QueryPtr query);
 
-	// Result of the query whose callback is currently running, if any.
-	const PGresult* activeResult() const { return activeResult_; }
+	// Results of the query whose callback is currently running, if any. A
+	// transaction has one per statement; pg_select_result picks which one the
+	// pg_get_* natives read (the last one by default).
+	const PGresult* activeResult() const;
+	int activeResultCount() const;
+	bool selectResult(int index);
 
 	void logError(const char* fmt, ...);
 
@@ -77,16 +92,25 @@ private:
 	IPawnComponent* pawn_ = nullptr;
 
 	CompletionQueue completions_;
-	std::map<int, std::unique_ptr<Connection>> connections_;
+	struct OwnedConnection
+	{
+		IPawnScript* owner = nullptr;
+		std::unique_ptr<Connection> connection;
+	};
+	std::map<int, OwnedConnection> connections_;
 	int nextConnectionId_ = 1;
 
 	std::unordered_map<int, PendingQuery> pendingQueries_;
 	int nextPendingQueryId_ = 1;
 
+	std::unordered_map<int, PendingTransaction> pendingTransactions_;
+	int nextPendingTransactionId_ = 1;
+
 	std::unordered_map<IPawnScript*, uint64_t> scripts_;
 	uint64_t nextGeneration_ = 1;
 
-	const PGresult* activeResult_ = nullptr;
+	const Query* activeQuery_ = nullptr;
+	int activeIndex_ = 0;
 };
 
 // Defined in natives.cpp.

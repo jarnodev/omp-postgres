@@ -31,6 +31,29 @@ public OnFilterScriptInit()
 
 	// Should fail and land in OnPgError.
 	pg_query(g_DB, "SELECT * FROM table_that_does_not_exist", "OnNeverCalled");
+
+	// The same prepared statement twice: the second run reuses it.
+	for (new i = 0; i < 2; i++)
+	{
+		q = pg_new_query(g_DB, "SELECT $1::int * 2 AS doubled");
+		pg_bind_int(q, 21 + i);
+		pg_send(q, "OnPrepared", "d", i);
+	}
+
+	// Transaction with two results.
+	new PgTx:tx = pg_tx_begin(g_DB);
+	q = pg_new_query(g_DB, "SELECT 1 AS first");
+	pg_tx_add(tx, q);
+	q = pg_new_query(g_DB, "SELECT $1::text AS second");
+	pg_bind_str(q, "two");
+	pg_tx_add(tx, q);
+	pg_tx_commit(tx, "OnTransaction");
+
+	// A failing statement rolls the whole transaction back and lands in OnPgError.
+	tx = pg_tx_begin(g_DB);
+	pg_tx_add(tx, pg_new_query(g_DB, "SELECT 1"));
+	pg_tx_add(tx, pg_new_query(g_DB, "SELECT 1/0"));
+	pg_tx_commit(tx, "OnNeverCalled");
 	return 1;
 }
 
@@ -59,6 +82,21 @@ public OnParams(number, const text[])
 	pg_get_str(0, "echo", echo);
 	printf("[pg_test] answer=%d echo=%s null=%d yes=%d | callback args: %d, %s",
 		pg_get_int(0, "answer"), echo, pg_is_null(0, "nothing"), pg_get_bool(0, "yes"), number, text);
+}
+
+forward OnPrepared(run);
+public OnPrepared(run)
+{
+	printf("[pg_test] prepared run %d: doubled=%d", run, pg_get_int(0, "doubled"));
+}
+
+forward OnTransaction();
+public OnTransaction()
+{
+	new second[16];
+	pg_get_str(0, "second", second);
+	pg_select_result(0);
+	printf("[pg_test] transaction: %d results, first=%d second=%s", pg_result_count(), pg_get_int(0, "first"), second);
 }
 
 forward OnNeverCalled();

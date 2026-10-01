@@ -78,5 +78,20 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	Threads::Threads
 )
 if(NOT MSVC)
-	target_link_libraries(${PROJECT_NAME} PRIVATE -static-libstdc++ -static-libgcc)
+	# Export only ComponentEntryPoint. Without this the statically linked libstdc++
+	# is exported too and can clash with other components loaded into the server.
+	target_compile_options(${PROJECT_NAME} PRIVATE
+		-fvisibility=hidden
+		-fvisibility-inlines-hidden
+		-fstack-protector-strong
+		$<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
+	)
+	target_link_libraries(${PROJECT_NAME} PRIVATE
+		-static-libstdc++
+		-static-libgcc
+		-Wl,--exclude-libs,ALL
+		-Wl,-z,relro,-z,now
+		-Wl,--no-undefined
+		$<$<CONFIG:Release>:-s>
+	)
 endif()

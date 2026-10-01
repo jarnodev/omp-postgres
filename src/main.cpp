@@ -66,8 +66,8 @@ void PostgresComponent::onFree(IComponent* component)
 
 void PostgresComponent::reset()
 {
-	// GMX: the gamemode reconnects in OnGameModeInit, so don't leak the old handles.
-	closeAll();
+	// GMX: the gamemode's connections were already closed when it unloaded;
+	// filterscripts stay loaded and keep theirs.
 }
 
 void PostgresComponent::closeAll()
@@ -75,6 +75,7 @@ void PostgresComponent::closeAll()
 	// Closing waits for each connection's queue to drain (pending saves).
 	connections_.clear();
 	pendingQueries_.clear();
+	pendingTransactions_.clear();
 	// Callbacks of what just finished have nobody left to receive them.
 	completions_.takeAll();
 }
@@ -92,6 +93,16 @@ void PostgresComponent::onAmxUnload(IPawnScript& script)
 	{
 		it = it->second.owner == &script ? pendingQueries_.erase(it) : std::next(it);
 	}
+	for (auto it = pendingTransactions_.begin(); it != pendingTransactions_.end();)
+	{
+		it = it->second.owner == &script ? pendingTransactions_.erase(it) : std::next(it);
+	}
+	// Erasing waits for each connection's queue to drain, so saves sent from
+	// OnGameModeExit/OnFilterScriptExit still land.
+	for (auto it = connections_.begin(); it != connections_.end();)
+	{
+		it = it->second.owner == &script ? connections_.erase(it) : std::next(it);
+	}
 }
 
 uint64_t PostgresComponent::generationOf(IPawnScript* script) const
@@ -100,7 +111,7 @@ uint64_t PostgresComponent::generationOf(IPawnScript* script) const
 	return it == scripts_.end() ? 0 : it->second;
 }
 
-int PostgresComponent::connect(const std::string& conninfo, std::string& error)
+int PostgresComponent::connect(IPawnScript* owner, const std::string& conninfo, std::string& error)
 {
 	PGconn* conn = Connection::open(conninfo, error);
 	if (conn == nullptr)
@@ -109,7 +120,7 @@ int PostgresComponent::connect(const std::string& conninfo, std::string& error)
 		return 0;
 	}
 	int id = nextConnectionId_++;
-	connections_.emplace(id, std::make_unique<Connection>(id, conn, completions_));
+	connections_.emplace(id, OwnedConnection { owner, std::make_unique<Connection>(id, conn, completions_) });
 	return id;
 }
 
@@ -121,7 +132,7 @@ bool PostgresComponent::disconnect(int id)
 Connection* PostgresComponent::connection(int id)
 {
 	auto it = connections_.find(id);
-	return it == connections_.end() ? nullptr : it->second.get();
+	return it == connections_.end() ? nullptr : it->second.connection.get();
 }
 
 int PostgresComponent::newPendingQuery(int connectionId, IPawnScript* owner, std::string sql)
@@ -130,7 +141,8 @@ int PostgresComponent::newPendingQuery(int connectionId, IPawnScript* owner, std
 	PendingQuery& q = pendingQueries_[id];
 	q.connectionId = connectionId;
 	q.owner = owner;
-	q.sql = std::move(sql);
+	q.statement.sql = std::move(sql);
+	q.statement.prepare = true;
 	return id;
 }
 
@@ -143,6 +155,50 @@ PendingQuery* PostgresComponent::pendingQuery(int id)
 void PostgresComponent::dropPendingQuery(int id)
 {
 	pendingQueries_.erase(id);
+}
+
+int PostgresComponent::newPendingTransaction(int connectionId, IPawnScript* owner)
+{
+	int id = nextPendingTransactionId_++;
+	PendingTransaction& tx = pendingTransactions_[id];
+	tx.connectionId = connectionId;
+	tx.owner = owner;
+	return id;
+}
+
+PendingTransaction* PostgresComponent::pendingTransaction(int id)
+{
+	auto it = pendingTransactions_.find(id);
+	return it == pendingTransactions_.end() ? nullptr : &it->second;
+}
+
+void PostgresComponent::dropPendingTransaction(int id)
+{
+	pendingTransactions_.erase(id);
+}
+
+const PGresult* PostgresComponent::activeResult() const
+{
+	if (activeQuery_ == nullptr || activeIndex_ < 0 || activeIndex_ >= activeResultCount())
+	{
+		return nullptr;
+	}
+	return activeQuery_->results[activeIndex_];
+}
+
+int PostgresComponent::activeResultCount() const
+{
+	return activeQuery_ ? static_cast<int>(activeQuery_->results.size()) : 0;
+}
+
+bool PostgresComponent::selectResult(int index)
+{
+	if (activeQuery_ == nullptr || index < 0 || index >= activeResultCount())
+	{
+		return false;
+	}
+	activeIndex_ = index;
+	return true;
 }
 
 void PostgresComponent::send(QueryPtr query)
@@ -170,12 +226,13 @@ void PostgresComponent::deliver(Query& query)
 	if (query.failed())
 	{
 		std::string error = trimmed(query.error);
-		logError("[postgres] Query failed (%s): %s | callback: %s | query: %s", query.sqlState.c_str(),
-			error.c_str(), query.callback.empty() ? "-" : query.callback.c_str(), query.sql.c_str());
+		logError("[postgres] %s failed (%s): %s | callback: %s | query: %s",
+			query.transaction ? "Transaction" : "Query", query.sqlState.c_str(), error.c_str(),
+			query.callback.empty() ? "-" : query.callback.c_str(), query.failedSql.c_str());
 		if (scriptAlive)
 		{
 			script->Call("OnPgError", DefaultReturnValue_True, query.connectionId, StringView(query.sqlState),
-				StringView(error), StringView(query.callback), StringView(query.sql));
+				StringView(error), StringView(query.callback), StringView(query.failedSql));
 		}
 		return;
 	}
@@ -202,13 +259,14 @@ void PostgresComponent::deliver(Query& query)
 			: script->Push(it->cell);
 	}
 
-	activeResult_ = query.result;
+	activeQuery_ = &query;
+	activeIndex_ = static_cast<int>(query.results.size()) - 1;
 	cell ret = 0;
 	if (err == AMX_ERR_NONE)
 	{
 		err = script->Exec(&ret, index);
 	}
-	activeResult_ = nullptr;
+	activeQuery_ = nullptr;
 	script->Release(heap);
 
 	if (err != AMX_ERR_NONE)

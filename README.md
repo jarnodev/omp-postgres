@@ -8,6 +8,8 @@ Asynchronous PostgreSQL access for [open.mp](https://open.mp), as a native serve
 - Failed queries call `OnPgError` (with the SQLSTATE code) instead of their callback.
 - Client encoding defaults to `WIN1252`, which is what SA-MP clients send; the database itself stays UTF-8.
 - Lost connections are re-established on the next query.
+- Statements built with `pg_new_query` are prepared once per connection and reused.
+- `pg_tx_begin` / `pg_tx_add` / `pg_tx_commit` run several statements atomically.
 
 ```pawn
 #include <open.mp>
@@ -55,6 +57,24 @@ the server directory:
 `pg_connect` takes any libpq connection string. `pg_connect("")` uses libpq's standard
 `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` environment variables, `~/.pgpass`
 and `PGSERVICE`, which keeps credentials out of scripts.
+
+Defaults that the connection string (or `PGCLIENTENCODING` / `PGCONNECT_TIMEOUT`) can override:
+`client_encoding=WIN1252`, `connect_timeout=10`, `application_name=omp-postgres`.
+
+A connection belongs to the script that opened it and is closed when that script unloads
+(after its queued queries have run), so a GMX doesn't touch filterscript connections.
+
+**Database on another machine:** add `sslmode=verify-full sslrootcert=...` to the connection
+string. libpq's default (`sslmode=prefer`) encrypts when it can but does not check who it is
+talking to, and silently falls back to plain text.
+
+**Transactions:** use `pg_tx_begin` / `pg_tx_add` / `pg_tx_commit`, which send `BEGIN`, the
+statements and `COMMIT` as one unit and roll back if any of them fails. Don't send `BEGIN` and
+`COMMIT` as separate queries: a dropped connection is re-established automatically, and an open
+transaction does not survive that.
+
+**PgBouncer** in transaction pooling mode (before 1.21) does not support prepared statements;
+call `pg_set_statement_cache(conn, 0)` after connecting.
 
 ## Build
 

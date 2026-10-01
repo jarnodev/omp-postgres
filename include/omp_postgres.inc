@@ -27,6 +27,7 @@
 
 #define PG_INVALID_CONNECTION (PgConn:0)
 #define PG_INVALID_QUERY      (PgQuery:0)
+#define PG_INVALID_TX         (PgTx:0)
 
 // ---- Connections ------------------------------------------------------------
 
@@ -47,8 +48,10 @@ native pg_pending(PgConn:conn);
 // ---- Queries ----------------------------------------------------------------
 
 // Starts building a parameterised query. Bind values in order: the first
-// pg_bind_* call fills $1, the second $2, and so on. Then pg_send it (or
-// pg_discard it); the handle is invalid afterwards.
+// pg_bind_* call fills $1, the second $2, and so on. Then pg_send it, add it
+// to a transaction with pg_tx_add, or pg_discard it; the handle is invalid afterwards.
+// The statement is prepared once per connection and reused, so keep the SQL
+// fixed and put everything that varies in parameters.
 native PgQuery:pg_new_query(PgConn:conn, const sql[]);
 native bool:pg_bind_int(PgQuery:query, value);
 native bool:pg_bind_float(PgQuery:query, Float:value);
@@ -65,7 +68,40 @@ native bool:pg_discard(PgQuery:query);
 // use pg_new_query + pg_bind_* for that.
 native bool:pg_query(PgConn:conn, const sql[], const callback[] = "", const format[] = "", {Float, _}:...);
 
+// How many prepared statements a connection keeps (least recently used are
+// dropped; default 100). 0 turns preparing off, which is needed behind
+// PgBouncer in transaction pooling mode.
+native bool:pg_set_statement_cache(PgConn:conn, size);
+
+// ---- Transactions -----------------------------------------------------------
+
+// Runs several queries atomically: all of them are applied, or none.
+//
+//     new PgTx:tx = pg_tx_begin(g_DB);
+//     new PgQuery:q = pg_new_query(g_DB, "UPDATE accounts SET money = money - $1 WHERE id = $2");
+//     pg_bind_int(q, amount); pg_bind_int(q, fromId);
+//     pg_tx_add(tx, q);
+//     q = pg_new_query(g_DB, "UPDATE accounts SET money = money + $1 WHERE id = $2");
+//     pg_bind_int(q, amount); pg_bind_int(q, toId);
+//     pg_tx_add(tx, q);
+//     pg_tx_commit(tx, "OnTransferDone", "d", playerid);
+//
+// If any statement fails, the transaction is rolled back and OnPgError gets
+// that statement's SQL. SQLSTATE "08007" means the connection dropped during
+// COMMIT, so whether it was applied is unknown.
+// In the callback, pg_select_result(i) chooses which statement's result the
+// pg_get_* natives read; the last one is selected by default.
+native PgTx:pg_tx_begin(PgConn:conn);
+// Moves a query built with pg_new_query into the transaction (the query handle is invalid afterwards).
+native bool:pg_tx_add(PgTx:tx, PgQuery:query);
+native bool:pg_tx_commit(PgTx:tx, const callback[] = "", const format[] = "", {Float, _}:...);
+native bool:pg_tx_discard(PgTx:tx);
+
 // ---- Results (only inside a query callback) ---------------------------------
+
+// Number of results: 1 for a query, one per statement for a transaction.
+native pg_result_count();
+native bool:pg_select_result(index);
 
 native pg_num_rows();
 native pg_num_fields();

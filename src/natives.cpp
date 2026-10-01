@@ -139,7 +139,7 @@ PG_NATIVE(n_pg_connect)
 {
 	PG_REQUIRE_PARAMS("pg_connect", 1);
 	g_lastConnectError.clear();
-	int id = component().connect(readString(*script, params[1]), g_lastConnectError);
+	int id = component().connect(script, readString(*script, params[1]), g_lastConnectError);
 	if (id == 0)
 	{
 		component().logError("[postgres] Connection failed: %s", g_lastConnectError.c_str());
@@ -209,7 +209,7 @@ bool bindValue(cell id, const char* native, QueryParam param)
 	{
 		return false;
 	}
-	q->params.push_back(std::move(param));
+	q->statement.params.push_back(std::move(param));
 	return true;
 }
 
@@ -261,8 +261,7 @@ PG_NATIVE(n_pg_send)
 	}
 	auto query = std::make_unique<Query>();
 	query->connectionId = pending->connectionId;
-	query->sql = std::move(pending->sql);
-	query->params = std::move(pending->params);
+	query->statements.push_back(std::move(pending->statement));
 	component().dropPendingQuery(params[1]);
 
 	if (!readCallback(*script, params, 2, "pg_send", *query))
@@ -298,13 +297,109 @@ PG_NATIVE(n_pg_query)
 	}
 	auto query = std::make_unique<Query>();
 	query->connectionId = params[1];
-	query->sql = readString(*script, params[2]);
+	query->statements.push_back(Statement { readString(*script, params[2]), {}, false });
 	if (!readCallback(*script, params, 3, "pg_query", *query))
 	{
 		return false;
 	}
 	component().send(std::move(query));
 	return true;
+}
+
+// bool:pg_set_statement_cache(PgConn:conn, size)
+PG_NATIVE(n_pg_set_statement_cache)
+{
+	PG_REQUIRE_PARAMS("pg_set_statement_cache", 2);
+	Connection* conn = component().connection(params[1]);
+	if (conn == nullptr)
+	{
+		component().logError("[postgres] pg_set_statement_cache: invalid connection %d.", params[1]);
+		return false;
+	}
+	conn->setStatementCacheSize(params[2]);
+	return true;
+}
+
+// ---- Transactions ----------------------------------------------------------
+
+PendingTransaction* transactionFor(cell id, const char* native)
+{
+	PendingTransaction* tx = component().pendingTransaction(id);
+	if (tx == nullptr)
+	{
+		component().logError("[postgres] %s: invalid transaction handle %d (already committed or discarded?).", native, id);
+	}
+	return tx;
+}
+
+// PgTx:pg_tx_begin(PgConn:conn)
+PG_NATIVE(n_pg_tx_begin)
+{
+	PG_REQUIRE_PARAMS("pg_tx_begin", 1);
+	if (component().connection(params[1]) == nullptr)
+	{
+		component().logError("[postgres] pg_tx_begin: invalid connection %d.", params[1]);
+		return 0;
+	}
+	return component().newPendingTransaction(params[1], script);
+}
+
+// bool:pg_tx_add(PgTx:tx, PgQuery:query)
+PG_NATIVE(n_pg_tx_add)
+{
+	PG_REQUIRE_PARAMS("pg_tx_add", 2);
+	PendingTransaction* tx = transactionFor(params[1], "pg_tx_add");
+	PendingQuery* query = pendingFor(params[2], "pg_tx_add");
+	if (tx == nullptr || query == nullptr)
+	{
+		return false;
+	}
+	if (query->connectionId != tx->connectionId)
+	{
+		component().logError("[postgres] pg_tx_add: query %d is for connection %d, transaction %d for connection %d.",
+			params[2], query->connectionId, params[1], tx->connectionId);
+		return false;
+	}
+	tx->statements.push_back(std::move(query->statement));
+	component().dropPendingQuery(params[2]);
+	return true;
+}
+
+// bool:pg_tx_commit(PgTx:tx, const callback[] = "", const format[] = "", {Float, _}:...)
+PG_NATIVE(n_pg_tx_commit)
+{
+	PG_REQUIRE_PARAMS("pg_tx_commit", 1);
+	PendingTransaction* tx = transactionFor(params[1], "pg_tx_commit");
+	if (tx == nullptr)
+	{
+		return false;
+	}
+	auto query = std::make_unique<Query>();
+	query->connectionId = tx->connectionId;
+	query->transaction = true;
+	query->statements = std::move(tx->statements);
+	component().dropPendingTransaction(params[1]);
+
+	if (!readCallback(*script, params, 2, "pg_tx_commit", *query))
+	{
+		return false;
+	}
+	if (component().connection(query->connectionId) == nullptr)
+	{
+		component().logError("[postgres] pg_tx_commit: connection %d was closed.", query->connectionId);
+		return false;
+	}
+	component().send(std::move(query));
+	return true;
+}
+
+// bool:pg_tx_discard(PgTx:tx)
+PG_NATIVE(n_pg_tx_discard)
+{
+	PG_REQUIRE_PARAMS("pg_tx_discard", 1);
+	bool existed = component().pendingTransaction(params[1]) != nullptr;
+	component().dropPendingTransaction(params[1]);
+	return existed;
 }
 
 // ---- Results (only valid inside a query callback) ---------------------------
@@ -431,6 +526,26 @@ cell getStr(IPawnScript& script, const char* native, cell row, int column, cell 
 	}
 	writeString(script, dest, StringView(value), size);
 	return static_cast<cell>(std::strlen(value));
+}
+
+// pg_result_count()
+PG_NATIVE(n_pg_result_count)
+{
+	PG_REQUIRE_PARAMS("pg_result_count", 0);
+	return component().activeResultCount();
+}
+
+// bool:pg_select_result(index)
+PG_NATIVE(n_pg_select_result)
+{
+	PG_REQUIRE_PARAMS("pg_select_result", 1);
+	if (!component().selectResult(params[1]))
+	{
+		component().logError("[postgres] pg_select_result: no result %d (%d available).", params[1],
+			component().activeResultCount());
+		return false;
+	}
+	return true;
 }
 
 // pg_num_rows()
@@ -561,6 +676,15 @@ const AMX_NATIVE_INFO g_natives[] = {
 	{ "pg_send", n_pg_send },
 	{ "pg_discard", n_pg_discard },
 	{ "pg_query", n_pg_query },
+	{ "pg_set_statement_cache", n_pg_set_statement_cache },
+
+	{ "pg_tx_begin", n_pg_tx_begin },
+	{ "pg_tx_add", n_pg_tx_add },
+	{ "pg_tx_commit", n_pg_tx_commit },
+	{ "pg_tx_discard", n_pg_tx_discard },
+
+	{ "pg_result_count", n_pg_result_count },
+	{ "pg_select_result", n_pg_select_result },
 
 	{ "pg_num_rows", n_pg_num_rows },
 	{ "pg_num_fields", n_pg_num_fields },
