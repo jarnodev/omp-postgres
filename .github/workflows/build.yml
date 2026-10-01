@@ -6,14 +6,11 @@ on:
     tags: ['v*']
   pull_request:
 
-permissions:
-  contents: write
-
 jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install 32-bit toolchain and libpq
         run: |
@@ -24,13 +21,64 @@ jobs:
       - name: Build and package
         run: ./package.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: omp-postgres-linux
+          name: linux
           path: dist/*.tar.gz
 
+  windows:
+    runs-on: windows-2022
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore vcpkg cache
+        uses: actions/cache@v6
+        with:
+          path: vcpkg-cache
+          key: vcpkg-x86-windows-static-libpq-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Install 32-bit static libpq
+        run: |
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg" install libpq:x86-windows-static
+
+      - name: Build
+        run: |
+          cmake -S . -B build -A Win32 `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x86-windows-static
+          cmake --build build --config Release --parallel
+
+      - name: Package
+        run: |
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(omp-postgres .*VERSION ([0-9.]+)\)').Matches[0].Groups[1].Value
+          $stage = "build\package"
+          New-Item -ItemType Directory -Force "$stage\components", "$stage\qawno\include", dist | Out-Null
+          Copy-Item build\Release\Postgres.dll "$stage\components\"
+          Copy-Item include\omp_postgres.inc "$stage\qawno\include\"
+          Copy-Item LICENSE, README.md $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\omp-postgres-$version-windows.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes

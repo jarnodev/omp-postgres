@@ -41,11 +41,14 @@ The full API, with comments, is in [`include/omp_postgres.inc`](include/omp_post
 
 ## Install
 
-From a release archive (`omp-postgres-<version>-linux.tar.gz`): extract it into the server
-directory. It contains `components/Postgres.so` and `qawno/include/omp_postgres.inc`.
+Download the archive for your platform from the [releases](../../releases) and extract it into
+the server directory:
 
-The server needs the **32-bit** libpq at runtime, because omp-server is a 32-bit program:
-`libpq.i686` (Fedora) or `libpq5:i386` (Debian/Ubuntu).
+- **Linux** (`omp-postgres-<version>-linux.tar.gz`): `components/Postgres.so` and
+  `qawno/include/omp_postgres.inc`. The server needs the **32-bit** libpq at runtime, because
+  omp-server is a 32-bit program: `libpq.i686` (Fedora) or `libpq5:i386` (Debian/Ubuntu).
+- **Windows** (`omp-postgres-<version>-windows.zip`): `components/Postgres.dll` and
+  `qawno/include/omp_postgres.inc`. libpq is linked in statically, so nothing else is needed.
 
 ## Connecting
 
@@ -67,8 +70,18 @@ sudo dnf install gcc-c++ cmake ninja-build glibc-devel.i686 libstdc++-devel.i686
 
 On Debian/Ubuntu: `dpkg --add-architecture i386 && apt install g++-multilib cmake ninja-build libpq-dev:i386`.
 
+On Windows, with Visual Studio 2022 and [vcpkg](https://vcpkg.io):
+
+```bat
+vcpkg install libpq:x86-windows-static
+cmake -S . -B build -A Win32 -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x86-windows-static
+cmake --build build --config Release        &:: -> build\Release\Postgres.dll
+```
+
 The open.mp SDK and the Pawn AMX headers are fetched by CMake at pinned commits.
 The version is set once, in `project()` in `CMakeLists.txt`.
+
+CI builds both platforms on every push; pushing a `v*` tag publishes a release with both archives.
 
 ## License
 

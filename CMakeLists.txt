@@ -5,11 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# omp-server is a 32-bit binary, so the component must be built as i386 too.
-# Configure with: cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/linux-i386.cmake
+# omp-server is a 32-bit binary, so the component must be built as 32-bit too.
+# Linux: -DCMAKE_TOOLCHAIN_FILE=cmake/linux-i386.cmake; Windows: -A Win32.
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
-	message(WARNING "Building a 64-bit omp-postgres: it will NOT load in the 32-bit omp-server. Use cmake/linux-i386.cmake.")
+	message(WARNING "Building a 64-bit omp-postgres: it will NOT load in the 32-bit omp-server.")
 endif()
+
+# Windows links libpq statically (vcpkg x86-windows-static), which needs the static CRT.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 include(FetchContent)
 
@@ -31,8 +34,15 @@ FetchContent_Declare(pawn-compiler
 )
 FetchContent_MakeAvailable(omp-sdk pawn-compiler)
 
-find_path(PQ_INCLUDE_DIR libpq-fe.h PATH_SUFFIXES postgresql pgsql REQUIRED)
-find_library(PQ_LIBRARY NAMES pq REQUIRED)
+if(WIN32)
+	# vcpkg's FindPostgreSQL wrapper adds OpenSSL and the Windows system libraries.
+	find_package(PostgreSQL REQUIRED)
+	set(PQ_LIBRARY PostgreSQL::PostgreSQL)
+	set(PQ_INCLUDE_DIR ${PostgreSQL_INCLUDE_DIRS})
+else()
+	find_path(PQ_INCLUDE_DIR libpq-fe.h PATH_SUFFIXES postgresql pgsql REQUIRED)
+	find_library(PQ_LIBRARY NAMES pq REQUIRED)
+endif()
 message(STATUS "libpq: ${PQ_LIBRARY} (headers: ${PQ_INCLUDE_DIR})")
 
 add_library(${PROJECT_NAME} SHARED
@@ -45,9 +55,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "" OUTPUT_NAME "Postgres
 
 target_include_directories(${PROJECT_NAME} PRIVATE
 	${pawn-compiler_SOURCE_DIR}/source
-	${pawn-compiler_SOURCE_DIR}/source/linux
 	${PQ_INCLUDE_DIR}
 )
+if(UNIX)
+	target_include_directories(${PROJECT_NAME} PRIVATE ${pawn-compiler_SOURCE_DIR}/source/linux)
+endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
 	PAWN_CELL_SIZE=32
@@ -64,6 +76,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	OMP-SDK
 	${PQ_LIBRARY}
 	Threads::Threads
-	-static-libstdc++
-	-static-libgcc
 )
+if(NOT MSVC)
+	target_link_libraries(${PROJECT_NAME} PRIVATE -static-libstdc++ -static-libgcc)
+endif()
