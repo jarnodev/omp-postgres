@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Added
 - `OnPgError` can return 0 to keep a handled error out of the server log.
@@ -33,6 +33,13 @@
 - Any `0A000` error was retried, not just a stale cached statement.
 - If pushing callback arguments failed, they were left on the script's stack.
 - The Linux build still exported three `std::thread` typeinfo symbols.
+
+### Upgrading
+- `OnPgError` used to ignore its return value. Return 1 to keep errors in the server log;
+  `return 0` now hides them.
+- Treat `08007` like a possibly applied write: check before retrying it.
+- Building on Windows: drop the `vcpkg install libpq` step; CMake installs libpq from `vcpkg.json`.
+  CMake 3.25 or newer is required.
 
 ## 0.2.0
 
