@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `OnPgError` can return 0 to keep a handled error out of the server log.
+- A warning in the log when many queries built with `pg_new_query` are never sent or discarded,
+  naming the most common SQL.
+- Connection tests (`tests/`), run by CI against PostgreSQL 18.
+- The Windows archive includes the licenses of the statically linked libpq, OpenSSL, zlib and lz4.
+
+### Changed
+- Closing a connection (`pg_close`, script unload, GMX, shutdown) cancels a query still running
+  after 10 seconds and fails the ones queued behind it with `08003`, instead of waiting forever.
+- Connections default to TCP keepalives and `tcp_user_timeout=30000`, so a vanished server or
+  network is noticed within about a minute.
+- A single statement whose connection dropped after it was sent fails with `08007` (outcome
+  unknown) instead of `08006`.
+- Windows builds pin libpq through `vcpkg.json`; CMake installs it while configuring.
+
+### Fixed
+- The first query after the server closed an idle connection (restart, `pg_terminate_backend`)
+  failed; the drop is now noticed and the connection re-established before sending.
+- A transaction whose connection dropped before `COMMIT` failed instead of being retried.
+- Handle ids could overflow after 2^31 queries and return the invalid handle 0.
+- `pg_get_str`, `pg_field_name` and `pg_connect_error` could write past the script's memory when
+  given a size larger than the array.
+- `pg_bind_float` and `pg_get_float` depended on the C locale.
+- `pg_get_int` returned the fallback for values beyond 64 bits instead of clamping like other
+  out-of-range values.
+- `pg_pending` could still count a query whose callback was running.
+- One failing `DEALLOCATE` skipped the rest, leaving statements on the server.
+- Any `0A000` error was retried, not just a stale cached statement.
+- If pushing callback arguments failed, they were left on the script's stack.
+- The Linux build still exported three `std::thread` typeinfo symbols.
+
 ## 0.2.0
 
 ### Added

@@ -85,6 +85,7 @@ public:
 private:
 	void deliver(Query& query);
 	void closeAll();
+	void checkPendingLeak();
 
 	static PostgresComponent* instance_;
 
@@ -98,13 +99,15 @@ private:
 		std::unique_ptr<Connection> connection;
 	};
 	std::map<int, OwnedConnection> connections_;
-	int nextConnectionId_ = 1;
+	uint32_t nextConnectionId_ = 1;
 
 	std::unordered_map<int, PendingQuery> pendingQueries_;
-	int nextPendingQueryId_ = 1;
+	uint32_t nextPendingQueryId_ = 1;
 
 	std::unordered_map<int, PendingTransaction> pendingTransactions_;
-	int nextPendingTransactionId_ = 1;
+	uint32_t nextPendingTransactionId_ = 1;
+	// Warn when this many queries/transactions were built but never sent or discarded.
+	size_t pendingWarnAt_ = 1000;
 
 	std::unordered_map<IPawnScript*, uint64_t> scripts_;
 	uint64_t nextGeneration_ = 1;

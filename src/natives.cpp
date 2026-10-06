@@ -1,7 +1,7 @@
 // Pawn natives. Keep in sync with include/omp_postgres.inc.
 #include "component.hpp"
 
-#include <cerrno>
+#include <charconv>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +64,15 @@ void writeString(IPawnScript& script, cell addr, StringView str, cell size)
 	cell* phys = nullptr;
 	if (size <= 0 || script.GetAddr(addr, &phys) != AMX_ERR_NONE || phys == nullptr)
 	{
+		return;
+	}
+	// GetAddr only checks where the buffer starts; a size larger than the array
+	// would let SetString write past the script's memory.
+	cell* last = nullptr;
+	int64_t lastAddr = static_cast<int64_t>(addr) + (static_cast<int64_t>(size) - 1) * static_cast<int64_t>(sizeof(cell));
+	if (lastAddr > INT32_MAX || script.GetAddr(static_cast<cell>(lastAddr), &last) != AMX_ERR_NONE)
+	{
+		component().logError("[postgres] Destination size %d runs past the end of the script's memory.", size);
 		return;
 	}
 	script.SetString(phys, str, false, false, static_cast<size_t>(size));
@@ -224,9 +233,10 @@ PG_NATIVE(n_pg_bind_int)
 PG_NATIVE(n_pg_bind_float)
 {
 	PG_REQUIRE_PARAMS("pg_bind_float", 2);
+	// Unlike snprintf, to_chars ignores the C locale, which could make the decimal point a comma.
 	char buf[32];
-	std::snprintf(buf, sizeof buf, "%.9g", cellToFloat(params[2]));
-	return bindValue(params[1], "pg_bind_float", { false, buf });
+	std::to_chars_result r = std::to_chars(buf, buf + sizeof buf, cellToFloat(params[2]));
+	return bindValue(params[1], "pg_bind_float", { false, std::string(buf, r.ptr) });
 }
 
 // bool:pg_bind_str(PgQuery:query, const value[])
@@ -457,10 +467,10 @@ int columnByName(IPawnScript& script, cell nameAddr, const char* native)
 
 cell parseInt(const char* value, cell fallback)
 {
-	errno = 0;
 	char* end = nullptr;
+	// Decimals are truncated ("12.5" -> 12); out of range values clamp (ERANGE leaves LLONG_MIN/MAX).
 	long long v = std::strtoll(value, &end, 10);
-	if (end == value || errno == ERANGE)
+	if (end == value)
 	{
 		return fallback;
 	}
@@ -490,9 +500,11 @@ cell getFloat(const char* native, cell row, int column, cell fallback)
 	{
 		return fallback;
 	}
-	char* end = nullptr;
-	float f = std::strtof(value, &end);
-	return end == value ? fallback : floatToCell(f);
+	// from_chars ignores the C locale and reads Postgres' "Infinity"/"NaN".
+	float f;
+	const char* end = value + std::strlen(value);
+	std::from_chars_result r = std::from_chars(value + (*value == '+'), end, f);
+	return r.ec == std::errc() ? floatToCell(f) : fallback;
 }
 
 cell getBool(const char* native, cell row, int column, cell fallback)

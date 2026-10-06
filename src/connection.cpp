@@ -12,12 +12,27 @@ bool succeeded(const PGresult* res)
 	return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
 }
 
-// Errors raised before the statement ran, so running it again is safe:
-// 26000 = the prepared statement is gone (DISCARD ALL, pooler),
+// Errors from a cached prepared statement that mean it went stale, raised
+// before it ran: 26000 = the statement is gone (DISCARD ALL, pooler),
 // 0A000 = "cached plan must not change result type" after a schema change.
-bool retryable(const std::string& sqlState)
+bool staleStatement(const std::string& sqlState)
 {
 	return sqlState == "26000" || sqlState == "0A000";
+}
+
+// PQcancel opens a new connection to the server, which takes as long as the
+// network allows, so it runs on its own thread instead of holding up close().
+void cancelInBackground(PGcancel* cancel)
+{
+	if (cancel == nullptr)
+	{
+		return;
+	}
+	std::thread([cancel] {
+		char error[256];
+		PQcancel(cancel, error, sizeof error);
+		PQfreeCancel(cancel);
+	}).detach();
 }
 }
 
@@ -38,30 +53,37 @@ std::vector<QueryPtr> CompletionQueue::takeAll()
 PGconn* Connection::open(const std::string& conninfo, std::string& error)
 {
 	// Later entries win, and `dbname` is expanded into whatever `conninfo` sets.
+	std::vector<const char*> keys;
+	std::vector<const char*> values;
+	auto add = [&](const char* key, const char* value) {
+		keys.push_back(key);
+		values.push_back(value);
+	};
 	// SA-MP clients send Windows-1252 bytes, not UTF-8, so let the server convert
 	// unless the conninfo or PGCLIENTENCODING already chose an encoding.
-	const char* keys[5];
-	const char* values[5];
-	int n = 0;
 	if (std::getenv("PGCLIENTENCODING") == nullptr)
 	{
-		keys[n] = "client_encoding";
-		values[n++] = "WIN1252";
+		add("client_encoding", "WIN1252");
 	}
 	// libpq waits forever by default, which would hang pg_connect and every reconnect.
 	if (std::getenv("PGCONNECT_TIMEOUT") == nullptr)
 	{
-		keys[n] = "connect_timeout";
-		values[n++] = "10";
+		add("connect_timeout", "10");
 	}
-	keys[n] = "fallback_application_name";
-	values[n++] = "omp-postgres";
-	keys[n] = "dbname";
-	values[n++] = conninfo.c_str();
-	keys[n] = nullptr;
-	values[n] = nullptr;
+	add("fallback_application_name", "omp-postgres");
+	// Notice a vanished server or network within about a minute; with the OS
+	// defaults a query can hang for 15 minutes or more.
+	add("keepalives_idle", "30");
+	add("keepalives_interval", "10");
+	add("keepalives_count", "3");
+	if (PQlibVersion() >= 120000)
+	{
+		add("tcp_user_timeout", "30000");
+	}
+	add("dbname", conninfo.c_str());
+	add(nullptr, nullptr);
 
-	PGconn* conn = PQconnectdbParams(keys, values, 1);
+	PGconn* conn = PQconnectdbParams(keys.data(), values.data(), 1);
 	if (conn == nullptr)
 	{
 		error = "out of memory";
@@ -80,6 +102,7 @@ Connection::Connection(int id, PGconn* conn, CompletionQueue& completions)
 	: id_(id)
 	, conn_(conn)
 	, completions_(completions)
+	, cancel_(PQgetCancel(conn))
 {
 	worker_ = std::thread(&Connection::run, this);
 }
@@ -87,6 +110,10 @@ Connection::Connection(int id, PGconn* conn, CompletionQueue& completions)
 Connection::~Connection()
 {
 	close();
+	if (cancel_)
+	{
+		PQfreeCancel(cancel_);
+	}
 	if (conn_)
 	{
 		PQfinish(conn_);
@@ -103,27 +130,34 @@ void Connection::enqueue(QueryPtr query)
 	wake_.notify_one();
 }
 
-void Connection::close()
+void Connection::close(std::chrono::milliseconds timeout)
 {
+	if (!worker_.joinable())
 	{
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (stopping_ && !worker_.joinable())
-		{
-			return;
-		}
+		return;
+	}
+	{
+		std::unique_lock<std::mutex> lock(mutex_);
 		stopping_ = true;
+		wake_.notify_one();
+		while (!finished_)
+		{
+			if (busy_ && !abandon_ && std::chrono::steady_clock::now() - busySince_ >= timeout)
+			{
+				abandon_ = true;
+				cancelInBackground(cancel_);
+				cancel_ = nullptr;
+			}
+			idle_.wait_for(lock, std::chrono::milliseconds(50));
+		}
 	}
-	wake_.notify_one();
-	if (worker_.joinable())
-	{
-		worker_.join();
-	}
+	worker_.join();
 }
 
 size_t Connection::pending() const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
-	return queue_.size() + inFlight_.load();
+	return queue_.size() + (busy_ ? 1 : 0);
 }
 
 void Connection::run()
@@ -131,21 +165,37 @@ void Connection::run()
 	for (;;)
 	{
 		QueryPtr query;
+		bool abandoned;
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
 			wake_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
 			// Drain the queue before stopping, so saves sent during shutdown still land.
 			if (queue_.empty())
 			{
+				finished_ = true;
+				idle_.notify_all();
 				return;
 			}
 			query = std::move(queue_.front());
 			queue_.pop_front();
-			inFlight_ = 1;
+			busy_ = true;
+			busySince_ = std::chrono::steady_clock::now();
+			abandoned = abandon_;
 		}
-		execute(*query);
+		if (abandoned)
+		{
+			query->error = "connection closed before the query ran";
+			query->sqlState = "08003"; // connection_does_not_exist
+		}
+		else
+		{
+			execute(*query);
+		}
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			busy_ = false;
+		}
 		completions_.push(std::move(query));
-		inFlight_ = 0;
 	}
 }
 
@@ -153,7 +203,18 @@ bool Connection::ensureConnected(std::string& error)
 {
 	if (PQstatus(conn_) == CONNECTION_OK)
 	{
-		return true;
+		// Notice a connection the server closed while idle (restart, pg_terminate_backend,
+		// idle_session_timeout) before sending anything on it. libpq's socket is
+		// non-blocking, so this never waits: the first call reads what the server
+		// sent, the second sees the end of the stream.
+		PQconsumeInput(conn_);
+		PQconsumeInput(conn_);
+		discardNotifications();
+		if (PQstatus(conn_) == CONNECTION_OK)
+		{
+			return true;
+		}
+		connected_ = false;
 	}
 	auto now = std::chrono::steady_clock::now();
 	if (now < nextReconnect_)
@@ -168,6 +229,7 @@ bool Connection::ensureConnected(std::string& error)
 	if (PQstatus(conn_) == CONNECTION_OK)
 	{
 		connected_ = true;
+		refreshCancel();
 		return true;
 	}
 	connected_ = false;
@@ -186,23 +248,31 @@ void Connection::execute(Query& query)
 	trimStatementCache(static_cast<size_t>(cacheSize_.load()));
 	flushDeallocations();
 
-	if (executeOnce(query))
+	if (executeOnce(query) || !retrySafe_)
 	{
 		return;
 	}
-	// Outside a transaction of the script's own, nothing has been applied: try once more.
-	if (retryable(query.sqlState) && PQstatus(conn_) == CONNECTION_OK && PQtransactionStatus(conn_) == PQTRANS_IDLE)
+	// Nothing was applied, so run it once more (on a new connection if it dropped).
+	std::string error;
+	if (!ensureConnected(error))
 	{
-		query.error.clear();
-		query.sqlState.clear();
-		query.failedSql.clear();
-		executeOnce(query);
+		return;
 	}
+	// A transaction of the script's own (BEGIN sent with pg_query) is still open; don't run outside it.
+	if (PQtransactionStatus(conn_) != PQTRANS_IDLE)
+	{
+		return;
+	}
+	query.error.clear();
+	query.sqlState.clear();
+	query.failedSql.clear();
+	executeOnce(query);
 }
 
 bool Connection::executeOnce(Query& query)
 {
 	query.clearResults();
+	retrySafe_ = false;
 
 	if (query.transaction)
 	{
@@ -210,6 +280,7 @@ bool Connection::executeOnce(Query& query)
 		if (!succeeded(res))
 		{
 			fail(query, res, "BEGIN");
+			retrySafe_ = PQstatus(conn_) != CONNECTION_OK;
 			return false;
 		}
 		PQclear(res);
@@ -221,14 +292,25 @@ bool Connection::executeOnce(Query& query)
 		if (!succeeded(res))
 		{
 			fail(query, res, statement.sql);
-			if (statement.prepare && retryable(query.sqlState))
+			if (lastExecCached_ && staleStatement(query.sqlState))
 			{
 				// 0A000 leaves the stale statement on the server; 26000 means it is already gone.
 				forgetStatement(statement.sql, query.sqlState == "0A000");
+				retrySafe_ = true;
 			}
 			if (query.transaction)
 			{
+				// The server rolls back a transaction whose connection drops before COMMIT.
+				if (PQstatus(conn_) != CONNECTION_OK)
+				{
+					retrySafe_ = true;
+				}
 				rollbackIfNeeded();
+			}
+			else if (PQstatus(conn_) != CONNECTION_OK && query.sqlState == "08006")
+			{
+				// The statement was sent, so it may have run and committed before the drop.
+				query.sqlState = "08007"; // transaction_resolution_unknown
 			}
 			return false;
 		}
@@ -271,6 +353,7 @@ PGresult* Connection::exec(const Statement& statement)
 		values.push_back(p.isNull ? nullptr : p.value.c_str());
 	}
 	int count = static_cast<int>(values.size());
+	lastExecCached_ = false;
 
 	size_t limit = static_cast<size_t>(cacheSize_.load());
 	if (!statement.prepare || limit == 0)
@@ -283,6 +366,7 @@ PGresult* Connection::exec(const Statement& statement)
 	if (it != statements_.end())
 	{
 		lru_.splice(lru_.begin(), lru_, it->second.lru);
+		lastExecCached_ = true;
 	}
 	else
 	{
@@ -367,14 +451,34 @@ void Connection::flushDeallocations()
 	{
 		return;
 	}
-	std::string sql;
+	// One command each: in a single multi-command string, one failure would skip the rest.
+	// The names are our own, never script input.
 	for (const std::string& name : toDeallocate_)
 	{
-		sql += "DEALLOCATE " + name + ";";
+		PQclear(simpleExec(("DEALLOCATE " + name).c_str()));
 	}
 	toDeallocate_.clear();
-	// Several commands need the simple protocol; the names are our own, never script input.
-	PQclear(PQexec(conn_, sql.c_str()));
+}
+
+void Connection::refreshCancel()
+{
+	// The cancel key changes with every new server session.
+	PGcancel* fresh = PQgetCancel(conn_);
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (cancel_)
+	{
+		PQfreeCancel(cancel_);
+	}
+	cancel_ = fresh;
+}
+
+void Connection::discardNotifications()
+{
+	// Only arrive after a LISTEN sent with pg_query; nothing reads them, so don't let them pile up.
+	while (PGnotify* notify = PQnotifies(conn_))
+	{
+		PQfreemem(notify);
+	}
 }
 
 void Connection::clearStatementCache()

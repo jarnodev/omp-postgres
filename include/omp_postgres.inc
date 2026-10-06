@@ -4,8 +4,8 @@
 // were sent. When a query finishes, its callback runs on the main thread and
 // the result is readable with the pg_get_* natives only inside that callback.
 //
-// Parameters ($1, $2, ...) are sent separately from the SQL text, so values
-// never need escaping and SQL injection is impossible:
+// Parameters ($1, $2, ...) are sent separately from the SQL text, so bound
+// values never need escaping and can't inject SQL:
 //
 //     new PgQuery:q = pg_new_query(g_DB, "SELECT id, money FROM accounts WHERE name = $1");
 //     pg_bind_str(q, name);
@@ -38,8 +38,12 @@
 native PgConn:pg_connect(const conninfo[]);
 native pg_connect_error(dest[], size = sizeof dest);
 
-// Waits for queued queries to finish, then closes the connection.
+// Waits for queued queries to finish, then closes the connection. A query still
+// running after 10 seconds is cancelled and the ones behind it fail (SQLSTATE
+// "08003"), so a lock wait can't freeze the server.
 native bool:pg_close(PgConn:conn);
+// The state seen by the last query: a connection that dropped while idle reports
+// true until the next query notices (and reconnects).
 native bool:pg_is_connected(PgConn:conn);
 
 // Queries waiting or running on this connection, or -1 for an invalid handle.
@@ -110,7 +114,8 @@ native pg_affected_rows();
 native pg_field_name(field, dest[], size = sizeof dest);
 
 // Field names are case-sensitive and match what the query returns.
-// NULL values (and errors) yield the fallback.
+// NULL values (and errors) yield the fallback. pg_get_int truncates decimals
+// ("12.5" -> 12) and clamps values outside the 32-bit range.
 native bool:pg_is_null(row, const field[]);
 native pg_get_int(row, const field[], fallback = 0);
 native Float:pg_get_float(row, const field[], Float:fallback = 0.0);
@@ -128,5 +133,8 @@ native pg_get_str_idx(row, field, dest[], size = sizeof dest);
 // ---- Callbacks --------------------------------------------------------------
 
 // Called in the script that sent a query when it fails. `sqlstate` is the
-// Postgres error code (e.g. "23505" = unique violation, "08006" = connection lost).
+// Postgres error code, e.g. "23505" = unique violation, "08006" = connection lost
+// and the query was not applied, "08007" = connection lost after sending, so it
+// may or may not have been applied. Return 0 to keep the error out of the server
+// log (when the script has handled it), 1 to log it as well.
 forward OnPgError(PgConn:conn, const sqlstate[], const error[], const callback[], const query[]);

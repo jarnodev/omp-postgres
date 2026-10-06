@@ -2,6 +2,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <unordered_map>
 
 PostgresComponent* PostgresComponent::instance_ = nullptr;
 
@@ -15,6 +16,19 @@ std::string trimmed(std::string s)
 		s.pop_back();
 	}
 	return s;
+}
+
+// Handles are 32-bit Pawn cells. The counter wraps after 2^32 handles (weeks on a
+// busy server), skipping 0, which scripts treat as invalid, and ids still in use.
+template <typename Map>
+int allocateId(uint32_t& next, const Map& used)
+{
+	int id;
+	do
+	{
+		id = static_cast<int>(next++);
+	} while (id == 0 || used.count(id) != 0);
+	return id;
 }
 }
 
@@ -119,7 +133,7 @@ int PostgresComponent::connect(IPawnScript* owner, const std::string& conninfo, 
 		error = trimmed(error);
 		return 0;
 	}
-	int id = nextConnectionId_++;
+	int id = allocateId(nextConnectionId_, connections_);
 	connections_.emplace(id, OwnedConnection { owner, std::make_unique<Connection>(id, conn, completions_) });
 	return id;
 }
@@ -137,13 +151,40 @@ Connection* PostgresComponent::connection(int id)
 
 int PostgresComponent::newPendingQuery(int connectionId, IPawnScript* owner, std::string sql)
 {
-	int id = nextPendingQueryId_++;
+	int id = allocateId(nextPendingQueryId_, pendingQueries_);
 	PendingQuery& q = pendingQueries_[id];
 	q.connectionId = connectionId;
 	q.owner = owner;
 	q.statement.sql = std::move(sql);
 	q.statement.prepare = true;
+	checkPendingLeak();
 	return id;
+}
+
+void PostgresComponent::checkPendingLeak()
+{
+	size_t count = pendingQueries_.size() + pendingTransactions_.size();
+	if (count < pendingWarnAt_)
+	{
+		return;
+	}
+	pendingWarnAt_ *= 2;
+	// The SQL built most often is the likeliest culprit.
+	std::unordered_map<std::string, size_t> bySql;
+	const std::string* worst = nullptr;
+	size_t worstCount = 0;
+	for (const auto& entry : pendingQueries_)
+	{
+		size_t n = ++bySql[entry.second.statement.sql];
+		if (n > worstCount)
+		{
+			worstCount = n;
+			worst = &entry.second.statement.sql;
+		}
+	}
+	logError("[postgres] %zu queries/transactions were built but never sent or discarded (missing pg_send, "
+			 "pg_discard or pg_tx_commit?). Most common: %zu x \"%s\"",
+		count, worstCount, worst ? worst->c_str() : "-");
 }
 
 PendingQuery* PostgresComponent::pendingQuery(int id)
@@ -159,10 +200,11 @@ void PostgresComponent::dropPendingQuery(int id)
 
 int PostgresComponent::newPendingTransaction(int connectionId, IPawnScript* owner)
 {
-	int id = nextPendingTransactionId_++;
+	int id = allocateId(nextPendingTransactionId_, pendingTransactions_);
 	PendingTransaction& tx = pendingTransactions_[id];
 	tx.connectionId = connectionId;
 	tx.owner = owner;
+	checkPendingLeak();
 	return id;
 }
 
@@ -226,13 +268,19 @@ void PostgresComponent::deliver(Query& query)
 	if (query.failed())
 	{
 		std::string error = trimmed(query.error);
-		logError("[postgres] %s failed (%s): %s | callback: %s | query: %s",
-			query.transaction ? "Transaction" : "Query", query.sqlState.c_str(), error.c_str(),
-			query.callback.empty() ? "-" : query.callback.c_str(), query.failedSql.c_str());
+		// OnPgError returns 0 when the script handled the error and doesn't want it logged.
+		bool log = true;
 		if (scriptAlive)
 		{
-			script->Call("OnPgError", DefaultReturnValue_True, query.connectionId, StringView(query.sqlState),
-				StringView(error), StringView(query.callback), StringView(query.failedSql));
+			log = script->Call("OnPgError", DefaultReturnValue_True, query.connectionId, StringView(query.sqlState),
+					  StringView(error), StringView(query.callback), StringView(query.failedSql))
+				!= 0;
+		}
+		if (log)
+		{
+			logError("[postgres] %s failed (%s): %s | callback: %s | query: %s",
+				query.transaction ? "Transaction" : "Query", query.sqlState.c_str(), error.c_str(),
+				query.callback.empty() ? "-" : query.callback.c_str(), query.failedSql.c_str());
 		}
 		return;
 	}
@@ -250,7 +298,10 @@ void PostgresComponent::deliver(Query& query)
 	}
 
 	// Pawn pushes arguments right to left.
+	AMX* amx = script->GetAMX();
 	cell heap = script->GetHEA();
+	cell stack = amx->stk;
+	int paramCount = amx->paramcount;
 	int err = AMX_ERR_NONE;
 	for (auto it = query.args.rbegin(); it != query.args.rend() && err == AMX_ERR_NONE; ++it)
 	{
@@ -265,6 +316,12 @@ void PostgresComponent::deliver(Query& query)
 	if (err == AMX_ERR_NONE)
 	{
 		err = script->Exec(&ret, index);
+	}
+	else
+	{
+		// Exec would have popped them; otherwise the script's next call receives them.
+		amx->stk = stack;
+		amx->paramcount = paramCount;
 	}
 	activeQuery_ = nullptr;
 	script->Release(heap);

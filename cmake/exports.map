@@ -1,0 +1,5 @@
+/* Export only the open.mp entry point; everything else stays inside the component. */
+{
+	global: ComponentEntryPoint;
+	local: *;
+};

@@ -1,0 +1,5 @@
+{
+  "$comment": "Windows only. builtin-baseline pins the libpq/OpenSSL versions; bump it deliberately.",
+  "dependencies": ["libpq"],
+  "builtin-baseline": "434307da09bc05b2c86996dccc8b2351fc0d5d37"
+}
