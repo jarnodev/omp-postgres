@@ -101,6 +101,10 @@ class Connection
 {
 public:
 	static constexpr int DefaultStatementCacheSize = 100;
+	// While closing, a query that runs longer than this is cancelled and the
+	// queries behind it fail without running, so a lock wait or a dead network
+	// can't freeze the server during a GMX, script unload or shutdown.
+	static constexpr std::chrono::milliseconds DefaultCloseTimeout { 10000 };
 
 	Connection(int id, PGconn* conn, CompletionQueue& completions);
 	~Connection();
@@ -115,9 +119,11 @@ public:
 
 	void enqueue(QueryPtr query);
 
-	// Lets queued queries finish, then stops the worker thread.
-	void close();
+	// Lets queued queries finish, then stops the worker thread (see DefaultCloseTimeout).
+	void close(std::chrono::milliseconds timeout = DefaultCloseTimeout);
 
+	// The state seen by the last query; a connection that dropped while idle
+	// still reports true until the next query notices.
 	bool isConnected() const { return connected_.load(); }
 	size_t pending() const;
 	int id() const { return id_; }
@@ -136,6 +142,8 @@ private:
 	PGresult* simpleExec(const char* sql);
 	void fail(Query& query, PGresult* res, const std::string& sql);
 	void rollbackIfNeeded();
+	void refreshCancel();
+	void discardNotifications();
 
 	// Prepared-statement cache, only touched by the worker thread.
 	void forgetStatement(const std::string& sql, bool deallocate);
@@ -147,14 +155,28 @@ private:
 	PGconn* conn_;
 	CompletionQueue& completions_;
 
+	// Guards everything up to the worker-only state below.
 	mutable std::mutex mutex_;
-	std::condition_variable wake_;
+	std::condition_variable wake_;  // worker: a query was queued, or stop
+	std::condition_variable idle_;  // close(): the worker finished
 	std::deque<QueryPtr> queue_;
 	bool stopping_ = false;
+	bool finished_ = false;
+	bool busy_ = false;
+	std::chrono::steady_clock::time_point busySince_ {};
+	// Set by close() after a timeout: queued queries fail without running.
+	bool abandon_ = false;
+	// Cancels the running query from another thread; refreshed on reconnect.
+	PGcancel* cancel_ = nullptr;
 	std::atomic<bool> connected_ { true };
-	std::atomic<size_t> inFlight_ { 0 };
+
+	// Worker-only state.
 	// While the server is down, queries fail fast instead of each waiting out a reconnect.
 	std::chrono::steady_clock::time_point nextReconnect_ {};
+	// Whether the last exec() ran a statement from the cache, and whether the
+	// last failed attempt can safely run again.
+	bool lastExecCached_ = false;
+	bool retrySafe_ = false;
 
 	struct CachedStatement
 	{
