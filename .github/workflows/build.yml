@@ -61,11 +61,16 @@ jobs:
           path: vcpkg-cache
           key: vcpkg-x86-windows-static-${{ hashFiles('vcpkg.json', '.github/workflows/build.yml') }}
 
-      # vcpkg.json pins a baseline that may be newer than the runner image's vcpkg checkout.
-      - name: Update vcpkg
+      # vcpkg reads port versions from its checked-out tree, so check out the baseline that
+      # vcpkg.json pins (usually newer than the runner image's copy) along with its vcpkg tool.
+      - name: Check out the vcpkg baseline
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
-          git -C "$env:VCPKG_INSTALLATION_ROOT" fetch --quiet origin
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git -C "$env:VCPKG_INSTALLATION_ROOT" fetch --quiet origin $baseline
+          git -C "$env:VCPKG_INSTALLATION_ROOT" checkout --quiet $baseline
+          & "$env:VCPKG_INSTALLATION_ROOT\bootstrap-vcpkg.bat" -disableMetrics
 
       # CMake installs libpq from vcpkg.json (manifest mode) while configuring.
       - name: Build
